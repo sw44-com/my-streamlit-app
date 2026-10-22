@@ -1,0 +1,24 @@
+> streamlit
+    > pandas
+    > numpy
+    > openpyxl
+    > st-gsheets-connection
+    > ```
+  </Step>
+
+  <Step subtitle="무료 클라우드 서비스 가입" title="Streamlit Community Cloud 가입">
+    1. 브라우저에서 **[share.streamlit.io](https://share.streamlit.io)**에 접속합니다.
+    2. **`Continue with GitHub`** 버튼을 눌러 GitHub 계정으로 연동 로그인합니다.
+  </Step>
+
+  <Step subtitle="24시간 구동 시작" title="앱 배포(Deploy)하여 프로그램 켜기">
+    1. 로그인 후 오른쪽 상단의 **`Create app`** (또는 `Deploy an app`) 버튼을 누릅니다.
+    2. **`I already have an app`**을 선택합니다.
+    3. 설정 정보를 입력합니다:
+       * **Repository:** GitHub에 올린 저장소 선택 (예: `본인아이디/bgf-production-plan`)
+       * **Branch:** `main` (기본값)
+       * **Main file path:** **`production_plan_app.py`** (★ 실제 파일명으로 수정됨)
+    4. 배포 설정 화면의 **`Advanced settings...`** (또는 배포 후 App settings > Secrets)로 이동하여 아까 정리해 드린 **Secrets** 항목을 붙여넣습니다.
+    5. 오른쪽 하단의 **`Deploy!`** 버튼을 누릅니다.
+  </Step>
+</Steps>
