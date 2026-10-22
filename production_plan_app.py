@@ -7,15 +7,15 @@ from datetime import date, datetime, timedelta
 import numpy as np
 import pandas as pd
 import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-SAVE_DIR = os.path.join(BASE, "saved_plans")  # 주차별 저장 폴더
-DC_PATH = os.path.join(BASE, "discontinued_list.xlsx")  # 업로드한 단종·단종예정 목록 (저장 유지)
+SAVE_DIR = os.path.join(BASE, "saved_plans")
+DC_PATH = os.path.join(BASE, "discontinued_list.xlsx")
 DC_META = os.path.join(BASE, "discontinued_meta.json")
 DC_MARKS = {11: "단종", 22: "단종예정"}
-OV_PATH = os.path.join(BASE, "mart_overrides.json")  # 마트 반영/제외 수동 보정 (코드별, 업로드 간 유지)
+OV_PATH = os.path.join(BASE, "mart_overrides.json")
 
-# 필수 열 (머리글의 그룹명+항목명으로 탐지 — 기존/신규 양식 모두 지원)
 LABEL = dict(code="상품코드", name="상품명", on_stock="온라인창고재고", mart_stock="마트창고재고", exp="유통기한(소비기한)",
              remain="남은유통기한", in_date="최근입고날짜", in_qty="최근입고수량", all4="전채널 판매수량(직전4주)",
              stockout="품절일수", sell_days="실판매일수", mt4="마트/도매 직전4주", mt_ly4="마트/도매 작년직전4주",
@@ -27,9 +27,16 @@ NUM = ["on_stock", "mart_stock", "in_qty", "all4", "stockout", "sell_days", "mt4
        "mt_lyn4", "on4", "on_ly4", "on_lyn4", "box", "oqty"]
 
 
+# 구글 시트 연결 객체 생성
+def get_gsheets_connection():
+    try:
+        return st.connection("gsheets", type=GSheetsConnection)
+    except Exception:
+        return None
+
+
 @st.cache_data(show_spinner=False)
 def parse_dc(data: bytes):
-    """단종 목록 엑셀: A열=표시(11 단종/22 단종예정), B열=상품코드. 반환 (marks, warns)"""
     from openpyxl import load_workbook
     ws = load_workbook(io.BytesIO(data), data_only=True).active
     hdr = next((r for r in range(1, 11) if str(ws.cell(r, 2).value or "").strip() == "상품코드"), None)
@@ -64,7 +71,6 @@ def parse_dc(data: bytes):
 
 
 def load_dc(up_dc):
-    """업로드가 있으면 저장·적용, 없으면 저장된 목록 사용. 반환 dict 또는 None"""
     name, saved_at = None, None
     if up_dc is not None:
         data, name = up_dc.getvalue(), up_dc.name
@@ -108,7 +114,6 @@ def sheet_names(data: bytes):
 
 
 def detect_layout(raw):
-    """머리글 2행(그룹/항목)으로 열 위치 탐지. 반환 {key: 열번호 또는 None}"""
     nz = lambda v: re.sub(r"\s+", "", str(v)) if pd.notna(v) else ""
     grp, g = [], ""
     for j in range(raw.shape[1]):
@@ -156,7 +161,6 @@ def load_base(data: bytes, sheet: str):
         g[k] = num(g[k])
     g["code"] = g["code"].astype(str).str.strip()
     has_m = all(L.get(f"m{i}") is not None for i in (1, 2, 3))
-    # 월별 판매(전채널) 최근 3개월 평균 → 4주 환산 (참고용, 신규 양식에만 존재)
     g["m3ref"] = (sum(num(d[L[f"m{i}"]]) for i in (1, 2, 3)) / 3 * 28 / 30) if has_m else np.nan
     g["exp_str"] = g["exp"].astype(str).str[:10]
     g["remain"] = pd.to_numeric(g["remain"], errors="coerce")
@@ -184,12 +188,11 @@ def load_base(data: bytes, sheet: str):
             mt4=f["mt4"], mt_ly4=f["mt_ly4"], mt_lyn4=f["mt_lyn4"],
             on4=f["on4"], on_ly4=f["on_ly4"], on_lyn4=f["on_lyn4"]))
     b = pd.DataFrame(rows)
-    b["auto"] = (b["mt_ly4"] > 0) | (b["mt_lyn4"] > 0)  # 작년 동기에 마트/도매 판매가 있으면 반복수요
+    b["auto"] = (b["mt_ly4"] > 0) | (b["mt_lyn4"] > 0)
     return b, bad
 
 
 def apply_incoming(b, bdate, days, on):
-    """입고예정 반영: 발주수량이 미입고(최근입고일 < 발주일)이고 입고예정일이 기준일~기준일+days 이내인 건만"""
     inc, inc_d, stat = np.zeros(len(b)), [""] * len(b), dict(valid=0, expired=0, total=0)
     for i, r in enumerate(b.itertuples()):
         if not (r.oqty and r.oqty > 0 and r.eta):
@@ -199,15 +202,15 @@ def apply_incoming(b, bdate, days, on):
             od = pd.to_datetime(r.odate).date()
             m = re.search(r"(\d{1,2})/(\d{1,2})", r.eta)
             eta = date(od.year, int(m.group(1)), int(m.group(2)))
-            if eta < od:  # 입고예정일은 연도 없이 월/일만 있어 발주일 이후 날짜로 추정
+            if eta < od:
                 eta = date(od.year + 1, eta.month, eta.day)
         except Exception:
             continue
         rec = pd.to_datetime(str(r.in_date).replace("/", "-"), errors="coerce")
         if pd.notna(rec) and rec.date() >= od:
-            continue  # 이미 입고됨
+            continue
         if eta < bdate:
-            stat["expired"] += 1  # 입고예정일 경과(입고 미확인) → 반영 안 함
+            stat["expired"] += 1
             continue
         if on and od <= bdate and eta <= bdate + timedelta(days=days):
             inc[i], inc_d[i] = r.oqty, f"{eta.month}/{eta.day}"
@@ -219,7 +222,7 @@ def apply_incoming(b, bdate, days, on):
 
 def season(this4, ly4, lyn4, cap):
     ly4, lyn4, this4 = ly4.to_numpy(float), lyn4.to_numpy(float), this4.to_numpy(float)
-    f = np.where(ly4 > 0, lyn4 / np.where(ly4 > 0, ly4, 1), 1.0)  # 작년 직전4주=0 이면 보정 없음
+    f = np.where(ly4 > 0, lyn4 / np.where(ly4 > 0, ly4, 1), 1.0)
     if cap > 0:
         f = np.minimum(f, cap)
     return this4 * f
@@ -229,8 +232,8 @@ def estimates(b, flags, cap, min_base=0):
     b = b.copy()
     on_s = season(b["on4"], b["on_ly4"], b["on_lyn4"], cap)
     mt_s = season(b["mt4"], b["mt_ly4"], b["mt_lyn4"], cap)
-    on_a, mt_a = b["on4"].to_numpy(float), b["mt4"].to_numpy(float)  # 단순평균 = 직전 4주 실적
-    if min_base > 0:  # 작년 직전4주 판매가 기준량 미만이면 계절보정 대신 단순평균 사용
+    on_a, mt_a = b["on4"].to_numpy(float), b["mt4"].to_numpy(float)
+    if min_base > 0:
         on_s = np.where(b["on_ly4"].to_numpy() >= min_base, on_s, on_a)
         mt_s = np.where(b["mt_ly4"].to_numpy() >= min_base, mt_s, mt_a)
     on = b["code"].map(flags).fillna(False).to_numpy(bool)
@@ -248,7 +251,7 @@ def rec_qty(short, lot):
 
 def build(b, view, meths, thr, qty=None):
     tot = b["on_stock"] + b["mart_stock"]
-    inc = b["inc"] if "inc" in b else pd.Series(0.0, index=b.index)  # 입고예정(온라인·합계 재고에 반영)
+    inc = b["inc"] if "inc" in b else pd.Series(0.0, index=b.index)
     on_eff = b["on_stock"] + inc
     stock = {"전체": tot + inc, "온라인": on_eff, "마트": b["mart_stock"]}[view]
     o = pd.DataFrame({"상품코드": b["code"], "상품명": b["name"],
@@ -276,8 +279,8 @@ def build(b, view, meths, thr, qty=None):
             on_short_l.append(on_sh.to_numpy())
         pos = est > 0
         ratio = np.where(pos, stock / est.where(pos, 1), np.nan)
-        need = pos & ((stock < est * thr) if thr else True)  # thr=None: 소진 판정 미적용
-        if qty:  # 선택 보기의 4주 예상판매가 qty 초과인 품목만
+        need = pos & ((stock < est * thr) if thr else True)
+        if qty:
             need = need & (est > qty)
         short = (est - stock).clip(lower=0)
         o[p + "4주예상판매"] = est.round(1)
@@ -291,7 +294,6 @@ def build(b, view, meths, thr, qty=None):
     need = np.any(needs, axis=0)
     dmin = np.min(days_l, axis=0)
     o["_need"], o["_dmin"], o["_short"] = need, dmin, np.max(short_l, axis=0)
-    # 정렬 키: 전체 보기는 온라인(비앤씨) 부족분 우선, 그다음 전체 부족분. 채널 보기는 해당 채널 부족분
     o["_key"] = np.max(on_short_l, axis=0) if view == "전체" else o["_short"]
     st_ = np.select([stock.to_numpy() <= 0, dmin <= 7, dmin <= 14], ["🔴 품절", "🔴 긴급(≤7일)", "🟠 주의(≤14일)"], "🟡 관찰")
     o.insert(0, "상태", np.where(need, st_, ""))
@@ -305,7 +307,6 @@ def pick(o):
 
 
 def _dw(v):
-    """엑셀 열 너비 단위 추정: 한글/전각 2, 그 외 1"""
     return sum(2 if ord(c) > 0x2E80 else 1 for c in str(v))
 
 
@@ -326,7 +327,6 @@ def _wrap_head(h):
 
 
 def warn_style(df, ratio):
-    """화면 표시용: 추천생산량이 4주예상판매 × ratio 초과인 셀을 노란색으로"""
     if not ratio or df.empty:
         return df
     sty = pd.DataFrame("", index=df.index, columns=df.columns)
@@ -369,13 +369,12 @@ def to_excel(sheets, params, warn=None):
             ws.row_dimensions[1].height = 15 * max((str(c.value).count("\n") + 1 for c in ws[1]), default=1) + 3
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
-            # 열 너비: 데이터 최대폭에 딱 맞춤 (헤더는 2줄까지 줄바꿈)
             for i, col in enumerate(ws.columns, 1):
                 head = str(col[0].value)
                 data_w = max((max(_dw(t) for t in str(c.value).split("\n")) for c in col[1:] if c.value is not None), default=0)
                 head_w = max(_dw(t) for t in head.replace("\n", " ").split())
                 width = max(data_w, head_w) + 2
-                if head == "상품명":  # 긴 상품명은 폭을 제한하고 줄바꿈
+                if head == "상품명":
                     width = min(width, 30)
                 ws.column_dimensions[get_column_letter(i)].width = max(width, 6)
             for row in ws.iter_rows(min_row=2):
@@ -395,14 +394,12 @@ def to_excel(sheets, params, warn=None):
                     key = str(row[0].value or "")[:2]
                     if key in fills:
                         row[0].fill = PatternFill("solid", fgColor=fills[key])
-            # 열 색상: 합계재고=옅은 하늘색, 4주예상판매=옅은 분홍색 (머리글 포함)
             for i, h in enumerate(orig, 1):
                 tint = "DCEEFB" if h == "합계재고" else ("FCE4EC" if h.endswith("4주예상판매") else None)
                 if tint:
                     for r in range(1, ws.max_row + 1):
                         ws.cell(r, i).fill = PatternFill("solid", fgColor=tint)
                     ws.cell(1, i).font = Font(bold=True, color="1F2937", size=10)
-            # 주의 표시: 추천생산량 > 4주예상판매 × warn → 노란색 (실무자 확인용)
             if warn:
                 ic = {h: i for i, h in enumerate(orig, 1)}
                 for h, i in ic.items():
@@ -412,7 +409,6 @@ def to_excel(sheets, params, warn=None):
                             rv, ev = ws.cell(r, i).value, ws.cell(r, e).value
                             if isinstance(rv, (int, float)) and isinstance(ev, (int, float)) and rv > 0 and rv > ev * warn:
                                 ws.cell(r, i).fill = PatternFill("solid", fgColor="FFFF00")
-            # 인쇄: A4 가로, 폭 1페이지에 맞춤, 머리글 반복
             ws.page_setup.orientation = "landscape"
             ws.page_setup.paperSize = 9
             ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
@@ -446,10 +442,8 @@ MODES = {"계절보정": ["S"], "단순평균": ["A"], "둘 다 비교": ["S", "
 drop_h = lambda df: df.drop(columns=[c for c in df.columns if c.startswith("_")])
 
 
-# ---------- 주간 저장 / 이력 ----------
 @st.cache_data(show_spinner=False)
 def base_date_of(data: bytes, sheet: str):
-    """시트 '날짜' 열(예: 2026-07-23 ~ 2026-10-14)의 종료일 = 기준일"""
     try:
         raw = pd.read_excel(io.BytesIO(data), sheet_name=sheet, header=None)
         v = raw.iloc[3, detect_layout(raw)["date"]]
@@ -463,8 +457,11 @@ def week_key(d):
     return f"{iso[0]}-W{iso[1]:02d}"
 
 
+# ★ 구글 시트 및 로컬 저장 병행 로직
 def save_week(data, fname, sheet, bdate, be, cfg, ov, dc=None):
     key = week_key(bdate)
+    
+    # 1. 로컬 저장 (서버 가동용)
     d = os.path.join(SAVE_DIR, key)
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "source.xlsx"), "wb") as f:
@@ -482,6 +479,27 @@ def save_week(data, fname, sheet, bdate, be, cfg, ov, dc=None):
                 dc_counts=dict(단종=dc["n11"], 단종예정=dc["n22"]) if dc else None)
     with open(os.path.join(d, "settings.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=1)
+
+    # 2. 구글 시트로 직접 저장 (DB 연동)
+    conn = get_gsheets_connection()
+    if conn is not None:
+        try:
+            # 설정을 시트에 업데이트 (settings 탭)
+            settings_df = pd.DataFrame([{
+                "week": key, "base_date": str(bdate), "saved_at": meta["saved_at"],
+                "file_name": fname, "sheet": sheet, "cap": cfg.get("cap"),
+                "min_base": cfg.get("min_base"), "thr": cfg.get("thr"), "qty": cfg.get("qty")
+            }])
+            conn.update(worksheet="settings", data=settings_df)
+
+            # 계산된 예측 데이터(be)를 구글 시트 estimates 탭에 저장
+            be_save = be.copy()
+            be_save["week"] = key
+            conn.update(worksheet="estimates", data=be_save.fillna(""))
+            st.toast("구글 시트 저장 성공! 📊")
+        except Exception as e:
+            st.warning(f"구글 시트 연동 저장 중 일부 문제가 발생했습니다: {e}")
+
     return key
 
 
@@ -512,7 +530,6 @@ def load_saved(key):
 
 
 def compare(sbe, cur, view, meth, thr, qty=None):
-    """저장된 4주 예상 vs 현재 파일의 실제 직전4주 판매"""
     act = cur[["code", "on4", "mt4"]].rename(columns={"on4": "on_act", "mt4": "mt_act"})
     m = sbe.merge(act, on="code", how="inner")
     stock = {"전체": m["on_stock"] + m["mart_stock"], "온라인": m["on_stock"], "마트": m["mart_stock"]}[view]
@@ -564,7 +581,6 @@ def plan_tab(up, dc, mode, cap, min_base, thr, qty, apply_dc, inc_on, inc_days, 
     elif not apply_dc:
         st.warning("단종·단종예정 제외가 꺼져 있습니다 (사이드바 체크박스).")
 
-    # 마트 1회성 보정 (C: 작년 동기 판매 있으면 반영 / D: 수동 체크)
     fid = (up.name, up.size, sheet)
     if st.session_state.get("fid") != fid:
         st.session_state["fid"], st.session_state["ov0"] = fid, load_ov()
@@ -611,7 +627,6 @@ def plan_tab(up, dc, mode, cap, min_base, thr, qty, apply_dc, inc_on, inc_days, 
               ("정렬", "4주 예상 부족분 많은 순 (전체 보기: 온라인(비앤씨) 부족분 우선 → 전체 부족분)"),
               ("추천생산량", "부족분(4주예상−재고)을 직전입고량 단위로 올림(최소 1회분), 입고이력 없으면 부족분 그대로")]
 
-    # 주간 저장 (수동, 같은 주차는 덮어쓰기)
     bdate = base_date_of(data, sheet) or datetime.now().date()
     key = week_key(bdate)
     old = read_meta(key)
@@ -619,7 +634,7 @@ def plan_tab(up, dc, mode, cap, min_base, thr, qty, apply_dc, inc_on, inc_days, 
     s1.caption(f"저장 주차: **{key}** (파일 기준일 {bdate})" + (f" — ⚠️ 이미 저장됨({old['saved_at']}), 저장하면 덮어씁니다." if old else ""))
     if s2.button("💾 이번 주 저장", use_container_width=True):
         save_week(data, up.name, sheet, bdate, be, dict(avg_mode="직전 4주 실적", cap=cap, min_base=min_base, thr=thr, qty=qty, inc_on=inc_on, inc_days=inc_days), ov, dc_on)
-        st.success(f"{key} 저장 완료 — '저장 이력·검증' 탭에서 확인하세요.")
+        st.success(f"{key} 저장 완료 — 구글 시트에 업데이트되었습니다.")
 
     label = st.radio("보기 (채널 선택 — 어느 채널이든 전체·온라인·마트 재고를 함께 표시)", list(VIEWS), horizontal=True)
     view = VIEWS[label]
@@ -669,7 +684,7 @@ def history_tab(ctx, warn=None):
     meta = read_meta(key)
     sbe = load_saved(key)
     n_ex = int(sbe["mark"].notna().sum())
-    sbe = sbe[sbe["mark"].isna()].reset_index(drop=True)  # 단종·단종예정 제외
+    sbe = sbe[sbe["mark"].isna()].reset_index(drop=True)
     with st.expander("저장 시 설정 / 원본 파일"):
         st.json({k: v for k, v in meta.items() if k not in ("summary", "mart_overrides")})
         with open(os.path.join(SAVE_DIR, key, "source.xlsx"), "rb") as f:
@@ -701,7 +716,6 @@ def history_tab(ctx, warn=None):
                        file_name=f"{key}_생산필요_{label[:2]}.xlsx", key="dl_hist",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    # ---- 검증: 저장된 예상 vs 현재 파일의 실제 판매 ----
     st.subheader("🔍 예상 검증 (저장된 4주 예상 vs 현재 업로드 파일의 실제 직전4주 판매)")
     if not ctx:
         st.info("검증하려면 왼쪽에서 이후 주차의 엑셀(저장 기준일로부터 약 4주 뒤)을 업로드하세요.")
