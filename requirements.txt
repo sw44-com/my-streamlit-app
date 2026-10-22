@@ -1,3 +1,5 @@
 streamlit
 pandas
+numpy
 openpyxl
+st-gsheets-connection
